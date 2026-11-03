@@ -1,7 +1,9 @@
-# SZ Map Dump
 
 # WARNING THIS FORK GENERATING AI
-# Fork может быть не стабильным учитывайте это при использовании его
+# Fork является не стабильным экспериментом учитывайте это при использовании его <img width="1919" height="1132" alt="Снимок экрана 2026-11-03 215005" src="https://github.com/user-attachments/assets/e10ef7de-167d-4bd3-a6e0-c3360825bf4f" />
+
+# SZ Map Dump
+
 
 Экспорт выбранных чанков игрового `map_cache` в Blender и Unreal Engine 5 (работает в экспериментальном режиме).
 
