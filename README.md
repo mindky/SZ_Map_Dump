@@ -1,6 +1,7 @@
 # SZ Map Dump
 
 # WARNING THIS FORK GENERATING AI
+# Fork может быть не стабильным учитывайте это при использовании его
 
 Экспорт выбранных чанков игрового `map_cache` в Blender и Unreal Engine 5 (работает в экспериментальном режиме).
 
