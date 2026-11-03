@@ -1,4 +1,6 @@
-# SC Map Dump
+# SZ Map Dump
+
+# WARNING THIS FORK GENERATING AI
 
 Экспорт выбранных чанков игрового `map_cache` в Blender и Unreal Engine 5.
 
