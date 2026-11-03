@@ -2,7 +2,7 @@
 
 # WARNING THIS FORK GENERATING AI
 
-Экспорт выбранных чанков игрового `map_cache` в Blender и Unreal Engine 5(работает в экспериментальном режиме).
+Экспорт выбранных чанков игрового `map_cache` в Blender и Unreal Engine 5 (работает в экспериментальном режиме).
 
 Поддерживаются:
 
