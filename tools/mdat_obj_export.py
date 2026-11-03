@@ -5,6 +5,10 @@ Standalone exporter for .mdat region files.
 The goal of this tool is to keep the decoded format obvious:
 region header -> zstd chunk payload -> section arrays -> AABB mesh -> OBJ.
 
+Both map cache layouts are supported and detected per region file:
+5.0/6.0 (24-byte header entries) and 7.0 (16-byte header entries with an
+8-byte chunk key repeated inside the payload).
+
 It emits render geometry from decoded terrain chunks. Unknown shape mappings
 fall back to full cubes, which keeps partial exports predictable.
 """
@@ -32,9 +36,113 @@ SECTOR_SIZE = 4096
 REGION_BITS = 5
 REGION_SIZE = 1 << REGION_BITS
 REGION_CHUNKS = REGION_SIZE * REGION_SIZE
-HEADER_INTS = 6
-HEADER_ENTRY_SIZE = HEADER_INTS * 4
-HEADER_SIZE = REGION_CHUNKS * HEADER_ENTRY_SIZE
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+@dataclass(frozen=True)
+class RegionFormat:
+    """Binary layout of a region file.
+
+    ``header_ints`` ints per chunk-entry in the region header.
+    ``payload_key_ints`` ints stored at the start of the chunk payload before
+    the primary/add masks (0 for legacy files, 2 for 7.0+ files where the
+    header entry and payload share an 8-byte chunk key).
+    """
+
+    name: str
+    header_ints: int
+    payload_key_ints: int
+
+    @property
+    def entry_size(self) -> int:
+        return self.header_ints * 4
+
+    @property
+    def header_size(self) -> int:
+        return REGION_CHUNKS * self.entry_size
+
+    @property
+    def min_sector(self) -> int:
+        return math.ceil(self.header_size / SECTOR_SIZE)
+
+    @property
+    def payload_header_size(self) -> int:
+        # declared length + optional chunk key + primary/add/raw/compressed + zstd magic
+        return 4 + self.payload_key_ints * 4 + 20
+
+
+# 5.0/6.0: header entry = sector, sector_count, uuid0..uuid3; payload starts
+# with primary_mask/add_mask.
+LEGACY_FORMAT = RegionFormat("6.0", header_ints=6, payload_key_ints=0)
+# 7.0: header entry = sector, sector_count, key0, key1; the same 8-byte key is
+# repeated inside the payload before the primary/add masks.
+V7_FORMAT = RegionFormat("7.0", header_ints=4, payload_key_ints=2)
+REGION_FORMATS = (V7_FORMAT, LEGACY_FORMAT)
+
+# Kept for backwards compatibility with callers that used the legacy constants.
+HEADER_INTS = LEGACY_FORMAT.header_ints
+HEADER_ENTRY_SIZE = LEGACY_FORMAT.entry_size
+HEADER_SIZE = LEGACY_FORMAT.header_size
+
+
+def detect_region_format(data: bytes) -> Optional[RegionFormat]:
+    """Pick the region layout that validates against the file contents."""
+    best: Optional[Tuple[int, RegionFormat]] = None
+    for fmt in REGION_FORMATS:
+        if len(data) < fmt.header_size + 4:
+            continue
+        valid = 0
+        invalid = 0
+        for local_index in range(REGION_CHUNKS):
+            offset = local_index * fmt.entry_size
+            values = struct.unpack_from(f">{fmt.header_ints}i", data, offset)
+            sector, sector_count = values[0], values[1]
+            if sector == 0 and sector_count == 0:
+                continue
+            if sector < fmt.min_sector or sector_count <= 0:
+                invalid += 1
+                break
+            payload_pos = sector * SECTOR_SIZE
+            if payload_pos + fmt.payload_header_size > len(data):
+                invalid += 1
+                break
+            declared_len = struct.unpack_from(">i", data, payload_pos)[0]
+            if declared_len <= 0 or declared_len > len(data):
+                invalid += 1
+                break
+            cursor = payload_pos + 4
+            if fmt.payload_key_ints:
+                key = struct.unpack_from(f">{fmt.payload_key_ints}i", data, cursor)
+                if key != values[2:2 + fmt.payload_key_ints]:
+                    invalid += 1
+                    break
+                cursor += fmt.payload_key_ints * 4
+            primary_mask, add_mask, raw_len, compressed_len = struct.unpack_from(">4i", data, cursor)
+            if not (0 <= primary_mask <= 0xFFFF and 0 <= add_mask <= 0xFFFF):
+                invalid += 1
+                break
+            if raw_len <= 0 or raw_len > 8 * 1024 * 1024:
+                invalid += 1
+                break
+            if compressed_len <= 0 or cursor + 16 + compressed_len > len(data):
+                invalid += 1
+                break
+            if data[cursor + 16: cursor + 20] != ZSTD_MAGIC:
+                invalid += 1
+                break
+            valid += 1
+        if invalid == 0 and valid > 0 and (best is None or valid > best[0]):
+            best = (valid, fmt)
+    return best[1] if best else None
+
+
+def resolve_region_format(data: bytes) -> Optional[RegionFormat]:
+    fmt = detect_region_format(data)
+    if fmt is not None:
+        return fmt
+    if len(data) < LEGACY_FORMAT.header_size:
+        return V7_FORMAT
+    return LEGACY_FORMAT
 
 AABB = Tuple[float, float, float, float, float, float]
 Face = Tuple[Tuple[float, float, float], ...]
@@ -317,31 +425,36 @@ def decode_section_blocks(raw: bytes, primary_mask: int, add_mask: int) -> Tuple
 def read_region(path: Path) -> Iterator[ChunkData]:
     rx, rz = parse_region_coords(path)
     data = path.read_bytes()
-    if len(data) < HEADER_SIZE:
+    fmt = resolve_region_format(data)
+    if fmt is None or len(data) < fmt.header_size:
         return
 
     dctx = zstd.ZstdDecompressor()
     for local_index in range(REGION_CHUNKS):
-        entry_offset = local_index * HEADER_ENTRY_SIZE
-        sector, sector_count, *_uuid = struct.unpack_from(">6i", data, entry_offset)
+        entry_offset = local_index * fmt.entry_size
+        values = struct.unpack_from(f">{fmt.header_ints}i", data, entry_offset)
+        sector, sector_count = values[0], values[1]
         if sector == 0 or sector_count == 0:
             continue
-        if sector < HEADER_SIZE // SECTOR_SIZE:
+        if sector < fmt.min_sector:
             continue
 
         payload_pos = sector * SECTOR_SIZE
-        if payload_pos + 4 > len(data):
+        payload_header = 4 + fmt.payload_key_ints * 4 + 16
+        if payload_pos + payload_header > len(data):
             continue
 
         declared_len = struct.unpack_from(">i", data, payload_pos)[0]
-        payload_len = declared_len - 1
-        payload = data[payload_pos + 4 : payload_pos + 4 + payload_len]
-        if len(payload) < 16:
+        cursor = payload_pos + 4
+        if fmt.payload_key_ints:
+            cursor += fmt.payload_key_ints * 4
+        primary_mask, add_mask, raw_len, compressed_len = struct.unpack_from(">4i", data, cursor)
+        if compressed_len <= 0 or cursor + 16 + compressed_len > len(data):
             continue
-
-        primary_mask, add_mask, raw_len, compressed_len = struct.unpack_from(">4i", payload, 0)
-        compressed = payload[16 : 16 + compressed_len]
-        decoded = dctx.decompress(compressed)
+        compressed = data[cursor + 16 : cursor + 16 + compressed_len]
+        # Map 5.0/6.0 had a 1 MB ceiling; 7.0 chunks with dense ProBuilder
+        # tiles can decode to several MB, so size the window from the header.
+        decoded = dctx.decompress(compressed, max_output_size=max(16 * 1024 * 1024, raw_len * 8))
         raw = decoded[:raw_len]
 
         local_x = local_index & (REGION_SIZE - 1)
@@ -5616,6 +5729,7 @@ def write_glb(
     force_double_sided: bool = False,
     force_mask: bool = False,
     hide_invisible: bool = False,
+    scale: float = 1.0,
 ) -> Tuple[int, int, int, int, int]:
     """Write a GLB file representing the resolved world geometry.
 
@@ -5672,6 +5786,11 @@ def write_glb(
         if should_flip:
             world_face = tuple(reversed(world_face))
             uvs = list(reversed(uvs))
+        if scale != 1.0:
+            # Unreal works in centimetres; glTF is metre-based, so the UE export
+            # bakes a uniform scale into the vertex data itself instead of
+            # relying on importer-specific unit conversions.
+            world_face = tuple((x * scale, y * scale, z * scale) for x, y, z in world_face)
         prim = builder.primitive_for_material(material_index)
         prim.add_polygon(world_face, uvs, _tint_to_rgba_u8(tint, alpha))
 
@@ -6131,6 +6250,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--group-by-cover", action="store_true", help="For ProBuilder tiles, include cover/data in OBJ groups.")
     parser.add_argument(
+        "--scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Bake a uniform scale into vertex coordinates. Unreal Engine works in "
+            "centimetres, so use --scale 100 for UE exports."
+        ),
+    )
+    parser.add_argument(
         "--model-placeholder",
         choices=("cross", "cube", "none"),
         default="cross",
@@ -6229,11 +6357,16 @@ def main() -> None:
         collect_biomes=True,
     )
 
-    export_blocks = {
-        pos: state
-        for pos, state in world_blocks.items()
-        if pos_in_bbox(pos, bbox) and (include_ids is None or state.block_id in include_ids)
-    }
+    if bbox is None and include_ids is None:
+        # Nothing to filter out: reuse the loaded dict instead of building a
+        # full second copy of it (that copy used to double peak RAM).
+        export_blocks = world_blocks
+    else:
+        export_blocks = {
+            pos: state
+            for pos, state in world_blocks.items()
+            if pos_in_bbox(pos, bbox) and (include_ids is None or state.block_id in include_ids)
+        }
     if args.max_blocks is not None and context_loads_extra:
         export_blocks = dict(sorted(export_blocks.items())[: args.max_blocks])
 
@@ -6285,6 +6418,7 @@ def main() -> None:
         force_double_sided=args.double_sided,
         force_mask=args.force_mask,
         hide_invisible=args.hide_invisible,
+        scale=args.scale,
     )
 
     strategy_counts: Dict[str, int] = {}
@@ -6323,6 +6457,19 @@ def main() -> None:
         )
     print("strategies=" + json.dumps(dict(sorted(strategy_counts.items())), ensure_ascii=False))
     print("top_ids=" + json.dumps(dict(sorted(block_id_counts.items(), key=lambda item: item[1], reverse=True)[:20])))
+    unknown_block_ids = sorted(
+        block_id
+        for block_id in block_id_counts
+        if block_id not in block_registry and block_id not in external_configs
+    )
+    if unknown_block_ids:
+        print(
+            "unknown_ids="
+            + json.dumps(
+                [(block_id, block_id_counts[block_id]) for block_id in unknown_block_ids[:40]],
+                ensure_ascii=False,
+            )
+        )
     print(
         f"glb={args.output} vertices={vertices} faces={faces} "
         f"materials={glb_materials} images={glb_images} bytes={glb_size}"

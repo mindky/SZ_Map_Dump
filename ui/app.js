@@ -378,9 +378,12 @@ async function refreshJobs() {
   for (const job of data.jobs || []) {
     const li = document.createElement("li");
     const status = job.running ? "running" : job.error ? "failed" : "done";
+    const batches = job.batches > 1 ? ` / ${job.batches} batches` : "";
+    const target = job.mode === "unreal" ? " / UE" : "";
+    const outputs = (job.parts || []).length > 1 ? `\n${job.parts.length} glb parts\n${escapeHtml(job.parts[0])}` : "";
     li.innerHTML = `
       <div><b>${escapeHtml(job.name)}</b> <span class="${job.error ? "bad" : job.running ? "warn" : "ok"}">${status}</span></div>
-      <div class="meta">${job.chunks} chunks${job.blend ? `\n${escapeHtml(job.blend)}` : ""}${job.error ? `\n${escapeHtml(job.error)}` : ""}</div>
+      <div class="meta">${job.chunks} chunks${batches}${target}${job.blend ? `\n${escapeHtml(job.blend)}` : ""}${outputs}${job.error ? `\n${escapeHtml(job.error)}` : ""}</div>
     `;
     els.jobs.appendChild(li);
   }
@@ -451,7 +454,12 @@ els.exportForm.addEventListener("submit", async ev => {
     els.status.textContent = "select chunks first";
     return;
   }
-  const options = { name: els.exportForm.elements.name.value };
+  const mode = ev.submitter && ev.submitter.dataset.mode === "unreal" ? "unreal" : "blender";
+  const options = { name: els.exportForm.elements.name.value, mode };
+  const batchChunks = Number(els.exportForm.elements.batch_chunks.value);
+  if (Number.isFinite(batchChunks) && batchChunks > 0) options.batch_chunks = batchChunks;
+  const unrealScale = Number(els.exportForm.elements.unreal_scale.value);
+  if (Number.isFinite(unrealScale) && unrealScale > 0) options.unreal_scale = unrealScale;
   const chunks = [...state.selected].map(parseKey);
   els.status.textContent = "export queued";
   await saveConfig();

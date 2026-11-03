@@ -52,7 +52,12 @@
         <h2>Export</h2>
         <form id="export-form">
           <input name="name" placeholder="blend name" autocomplete="off" />
-          <button id="export-btn" type="submit">Export .blend</button>
+          <input name="batch_chunks" type="number" min="25" max="2000" step="25" placeholder="chunks per batch (500)" autocomplete="off" />
+          <input name="unreal_scale" type="number" min="1" max="1000" step="1" placeholder="unreal scale (100)" autocomplete="off" />
+          <div class="row">
+            <button id="export-btn" type="submit" data-mode="blender">Export .blend</button>
+            <button id="export-ue-btn" type="submit" data-mode="unreal">Export UE</button>
+          </div>
         </form>
       </section>
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -65,6 +66,43 @@ def game_texture_paths(game_dir: Path) -> dict[str, Path]:
     }
 
 
+def steam_library_paths() -> list[Path]:
+    """Return Steam library roots discovered from the registry/vdf files."""
+    if os.name != "nt":
+        return []
+    try:
+        import winreg
+    except ImportError:  # pragma: no cover - non-Windows
+        return []
+    roots: list[Path] = []
+    for hive, key in (
+        (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam"),
+    ):
+        try:
+            with winreg.OpenKey(hive, key) as handle:
+                steam = Path(winreg.QueryValueEx(handle, "SteamPath")[0])
+        except OSError:
+            continue
+        if steam.is_dir() and steam not in roots:
+            roots.append(steam)
+    libraries: list[Path] = []
+    for steam in roots:
+        libraries.append(steam)
+        vdf = steam / "steamapps" / "libraryfolders.vdf"
+        if not vdf.is_file():
+            continue
+        try:
+            text = vdf.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for raw in re.findall(r'"path"\s+"([^"]+)"', text):
+            path = Path(raw.replace("\\\\", "\\"))
+            if path.is_dir() and path not in libraries:
+                libraries.append(path)
+    return libraries
+
+
 def find_blender(explicit: str | None = None) -> Path:
     candidates: list[Path] = []
     if explicit:
@@ -75,7 +113,11 @@ def find_blender(explicit: str | None = None) -> Path:
     which = shutil.which("blender")
     if which:
         candidates.append(Path(which))
+    for library in steam_library_paths():
+        candidates.append(library / "steamapps" / "common" / "Blender" / "blender.exe")
     candidates.extend([
+        Path(r"C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe"),
+        Path(r"C:\Program Files\Steam\steamapps\common\Blender\blender.exe"),
         Path(r"D:\SteamLibrary\steamapps\common\Blender\blender.exe"),
         Path(r"C:\Program Files\Blender Foundation\Blender 4.3\blender.exe"),
         Path(r"C:\Program Files\Blender Foundation\Blender 4.2\blender.exe"),

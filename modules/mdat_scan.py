@@ -13,10 +13,121 @@ SECTOR_SIZE = 4096
 REGION_BITS = 5
 REGION_SIZE = 1 << REGION_BITS
 REGION_CHUNKS = REGION_SIZE * REGION_SIZE
-HEADER_INTS = 6
-HEADER_ENTRY_SIZE = HEADER_INTS * 4
-HEADER_SIZE = REGION_CHUNKS * HEADER_ENTRY_SIZE
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 REGION_RE = re.compile(r"^reg\.(-?\d+)\.(-?\d+)\.mdat$")
+
+
+@dataclass(frozen=True)
+class RegionFormat:
+    """Binary layout of a region file.
+
+    ``header_ints`` ints per chunk-entry in the region header.
+    ``payload_key_ints`` ints stored at the start of the chunk payload before
+    the primary/add masks (0 for legacy files, 2 for 7.0+ files where the
+    header entry and payload share an 8-byte chunk key).
+    """
+
+    name: str
+    header_ints: int
+    payload_key_ints: int
+
+    @property
+    def entry_size(self) -> int:
+        return self.header_ints * 4
+
+    @property
+    def header_size(self) -> int:
+        return REGION_CHUNKS * self.entry_size
+
+    @property
+    def min_sector(self) -> int:
+        return math.ceil(self.header_size / SECTOR_SIZE)
+
+    @property
+    def payload_header_size(self) -> int:
+        # declared length + optional chunk key + primary/add/raw/compressed + zstd magic
+        return 4 + self.payload_key_ints * 4 + 20
+
+
+# 5.0/6.0: header entry = sector, sector_count, uuid0..uuid3; payload starts
+# with primary_mask/add_mask.
+LEGACY_FORMAT = RegionFormat("6.0", header_ints=6, payload_key_ints=0)
+# 7.0: header entry = sector, sector_count, key0, key1; the same 8-byte key is
+# repeated inside the payload before the primary/add masks.
+V7_FORMAT = RegionFormat("7.0", header_ints=4, payload_key_ints=2)
+REGION_FORMATS = (V7_FORMAT, LEGACY_FORMAT)
+
+# Kept for backwards compatibility with callers that used the legacy constants.
+HEADER_INTS = LEGACY_FORMAT.header_ints
+HEADER_ENTRY_SIZE = LEGACY_FORMAT.entry_size
+HEADER_SIZE = LEGACY_FORMAT.header_size
+
+
+def detect_region_format(data: bytes) -> RegionFormat | None:
+    """Pick the region layout that validates against the file contents.
+
+    Both candidate layouts are verified entry-by-entry: sector bounds, payload
+    masks and the zstd frame marker have to line up for every populated entry.
+    The 7.0 layout additionally requires the header key to match the copy
+    stored inside the payload, which makes the detection unambiguous.
+    """
+    best: tuple[int, RegionFormat] | None = None
+    for fmt in REGION_FORMATS:
+        if len(data) < fmt.header_size + 4:
+            continue
+        valid = 0
+        invalid = 0
+        for local_index in range(REGION_CHUNKS):
+            offset = local_index * fmt.entry_size
+            values = struct.unpack_from(f">{fmt.header_ints}i", data, offset)
+            sector, sector_count = values[0], values[1]
+            if sector == 0 and sector_count == 0:
+                continue
+            if sector < fmt.min_sector or sector_count <= 0:
+                invalid += 1
+                break
+            payload_pos = sector * SECTOR_SIZE
+            payload_header = fmt.payload_header_size
+            if payload_pos + payload_header > len(data):
+                invalid += 1
+                break
+            declared_len = struct.unpack_from(">i", data, payload_pos)[0]
+            if declared_len <= 0 or declared_len > len(data):
+                invalid += 1
+                break
+            cursor = payload_pos + 4
+            if fmt.payload_key_ints:
+                key = struct.unpack_from(f">{fmt.payload_key_ints}i", data, cursor)
+                if key != values[2:2 + fmt.payload_key_ints]:
+                    invalid += 1
+                    break
+                cursor += fmt.payload_key_ints * 4
+            primary_mask, add_mask, raw_len, compressed_len = struct.unpack_from(">4i", data, cursor)
+            if not (0 <= primary_mask <= 0xFFFF and 0 <= add_mask <= 0xFFFF):
+                invalid += 1
+                break
+            if raw_len <= 0 or raw_len > 8 * 1024 * 1024:
+                invalid += 1
+                break
+            if compressed_len <= 0 or cursor + 16 + compressed_len > len(data):
+                invalid += 1
+                break
+            if data[cursor + 16: cursor + 20] != ZSTD_MAGIC:
+                invalid += 1
+                break
+            valid += 1
+        if invalid == 0 and valid > 0 and (best is None or valid > best[0]):
+            best = (valid, fmt)
+    return best[1] if best else None
+
+
+def resolve_region_format(data: bytes) -> RegionFormat | None:
+    fmt = detect_region_format(data)
+    if fmt is not None:
+        return fmt
+    if len(data) < LEGACY_FORMAT.header_size:
+        return V7_FORMAT
+    return LEGACY_FORMAT
 
 
 @dataclass(frozen=True)
@@ -30,6 +141,7 @@ class ChunkRef:
     sector: int
     sectors: int
     file: Path
+    format: str = LEGACY_FORMAT.name
 
     def to_dict(self) -> dict:
         return {
@@ -40,6 +152,7 @@ class ChunkRef:
             "region_z": self.region_z,
             "local_index": self.local_index,
             "file": str(self.file),
+            "format": self.format,
         }
 
 
@@ -78,15 +191,16 @@ def scan_region(path: Path, world: str) -> list[ChunkRef]:
     if coords is None:
         return []
     data = path.read_bytes()
-    if len(data) < HEADER_SIZE:
+    fmt = resolve_region_format(data)
+    if fmt is None or len(data) < fmt.header_size:
         return []
     rx, rz = coords
     chunks: list[ChunkRef] = []
-    min_sector = math.ceil(HEADER_SIZE / SECTOR_SIZE)
     for local_index in range(REGION_CHUNKS):
-        offset = local_index * HEADER_ENTRY_SIZE
-        sector, sector_count, *_ = struct.unpack_from(">6i", data, offset)
-        if sector < min_sector or sector_count <= 0:
+        offset = local_index * fmt.entry_size
+        values = struct.unpack_from(f">{fmt.header_ints}i", data, offset)
+        sector, sector_count = values[0], values[1]
+        if sector < fmt.min_sector or sector_count <= 0:
             continue
         payload_pos = sector * SECTOR_SIZE
         if payload_pos + 4 > len(data):
@@ -103,6 +217,7 @@ def scan_region(path: Path, world: str) -> list[ChunkRef]:
             sector=sector,
             sectors=sector_count,
             file=path,
+            format=fmt.name,
         ))
     return chunks
 
@@ -186,13 +301,17 @@ def write_filtered_scan_chunks(scan: dict, out_dir: Path, selected: Iterable[tup
     for row in chunk_rows.values():
         by_file.setdefault(Path(row["file"]), []).append(row)
 
-    staged: dict[tuple[int, int], list[tuple[int, int, tuple[int, int, int, int], bytes]]] = {}
+    staged: dict[tuple[int, int], tuple[RegionFormat, list[tuple[int, int, tuple[int, ...], bytes]]]] = {}
     for source, rows in by_file.items():
         coords = parse_region_name(source)
         if coords is None:
             continue
         data = source.read_bytes()
+        fmt = resolve_region_format(data)
+        if fmt is None:
+            continue
         rx, rz = coords
+        bucket = staged.setdefault(coords, (fmt, []))
         for row in sorted(rows, key=lambda item: (int(item["x"]), int(item["z"]))):
             x = int(row["x"])
             z = int(row["z"])
@@ -201,27 +320,33 @@ def write_filtered_scan_chunks(scan: dict, out_dir: Path, selected: Iterable[tup
             if not (0 <= local_x < REGION_SIZE and 0 <= local_z < REGION_SIZE):
                 continue
             local_index = local_z * REGION_SIZE + local_x
-            entry_offset = local_index * HEADER_ENTRY_SIZE
-            sector, sector_count, *uuid_words = struct.unpack_from(">6i", data, entry_offset)
+            entry_offset = local_index * fmt.entry_size
+            if entry_offset + fmt.entry_size > len(data):
+                continue
+            values = struct.unpack_from(f">{fmt.header_ints}i", data, entry_offset)
+            sector, sector_count = values[0], values[1]
             if sector <= 0 or sector_count <= 0:
                 continue
             start = sector * SECTOR_SIZE
             end = start + sector_count * SECTOR_SIZE
-            if end > len(data):
+            if start >= len(data):
                 continue
-            staged.setdefault(coords, []).append((local_index, sector_count, tuple(uuid_words), data[start:end]))
+            payload = data[start:end]
+            if len(payload) < sector_count * SECTOR_SIZE:
+                payload += bytes(sector_count * SECTOR_SIZE - len(payload))
+            bucket[1].append((local_index, sector_count, tuple(values[2:]), payload))
 
     written = 0
-    for (rx, rz), payload_rows in staged.items():
-        header = bytearray(HEADER_SIZE)
+    for (rx, rz), (fmt, payload_rows) in staged.items():
+        header = bytearray(fmt.header_size)
         payloads = bytearray()
-        next_sector = math.ceil(HEADER_SIZE / SECTOR_SIZE)
+        next_sector = fmt.min_sector
         seen_local: set[int] = set()
-        for local_index, sector_count, uuid_words, payload in sorted(payload_rows, key=lambda item: item[0]):
+        for local_index, sector_count, key_words, payload in sorted(payload_rows, key=lambda item: item[0]):
             if local_index in seen_local:
                 continue
             seen_local.add(local_index)
-            struct.pack_into(">6i", header, local_index * HEADER_ENTRY_SIZE, next_sector, sector_count, *uuid_words)
+            struct.pack_into(f">{fmt.header_ints}i", header, local_index * fmt.entry_size, next_sector, sector_count, *key_words)
             payloads.extend(payload)
             next_sector += sector_count
             written += 1
