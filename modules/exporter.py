@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -11,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .glb_merge import MAX_GLB_BYTES, merge_glbs
+from .glb_merge import MAX_GLB_BYTES, merge_glbs, read_glb
 from .mdat_scan import write_filtered_scan_chunks
 from .paths import EXPORTS_DIR, MDAT_EXPORT_SCRIPT, ROOT, TMP_DIR, find_blender, game_texture_paths
 
@@ -195,7 +196,10 @@ def run_export(job: ExportJob, options: dict[str, Any]) -> None:
     job.batches = len(batches)
     job.log.append(f"mode={mode} chunks={len(job.selected)} batches={len(batches)} batch_chunks={batch_size}")
     if mode == "unreal":
-        job.log.append(f"unreal_scale={unreal_scale:g} (1 block = {unreal_scale:g} UE units)")
+        job.log.append(
+            f"unreal_scale={unreal_scale:g} UE units per block "
+            "(applied at import time so the GLB stays unit-precise)"
+        )
     if batch_size > MEMORY_WARN_CHUNKS:
         job.log.append(f"warning: {batch_size} chunks per batch is heavy, 300-500 is safer on 32 GB RAM")
 
@@ -211,6 +215,7 @@ def run_export(job: ExportJob, options: dict[str, Any]) -> None:
             shutil.rmtree(tmp_cache, ignore_errors=True)
             raise RuntimeError(f"batch {index}/{len(batches)}: selected chunks were not found in map_cache")
         part_glb = parts_dir / f"part_{index:03d}.glb"
+        mesh_name = job.name if len(batches) == 1 else f"{job.name}_{index:03d}"
         cmd = [
             sys.executable,
             str(MDAT_EXPORT_SCRIPT),
@@ -219,13 +224,17 @@ def run_export(job: ExportJob, options: dict[str, Any]) -> None:
             "--double-sided",
             "--force-mask",
             "--hide-invisible",
+            "--name", mesh_name,
             "--texarr", str(paths["texarr"]),
             "--ctm-dir", str(paths["ctm_dir"]),
             "--map-blocks", str(paths["map_blocks"]),
             "--weather-palettes", str(paths["weather_palettes"]),
         ]
-        if mode == "unreal" and unreal_scale != 1.0:
-            cmd.extend(["--scale", f"{unreal_scale:g}"])
+        if mode == "unreal" or len(batches) > 1:
+            # Multiple batches are merged afterwards, so every part must keep
+            # absolute world block coordinates: centering each batch on its own
+            # bounding box would make the merged parts overlap at the origin.
+            cmd.append("--no-center")
         job.log.append(f"[batch {index}/{len(batches)}] chunks={written} glb={part_glb.name}")
         job.log.append(" ".join(quote_part(part) for part in cmd))
         try:
@@ -268,7 +277,7 @@ def run_export(job: ExportJob, options: dict[str, Any]) -> None:
         shutil.rmtree(parts_dir, ignore_errors=True)
         job.glb = outputs[0] if len(outputs) == 1 else None
         job.parts = [str(path) for path in outputs]
-        helper = write_unreal_helpers(job.out_dir, outputs)
+        helper = write_unreal_helpers(job.out_dir, outputs, unreal_scale)
         job.log.append(f"unreal_scale={unreal_scale:g}")
         job.log.append(f"ue_import_script={helper}")
         job.log.append(
@@ -311,36 +320,147 @@ def run_export(job: ExportJob, options: dict[str, Any]) -> None:
     job.log.append("blend skipped: import the glb parts separately (one .blend with everything would not fit in RAM)")
 
 
-def write_unreal_helpers(out_dir: Path, outputs: list[Path]) -> Path:
-    """Generate an Unreal Engine import script next to the exported GLB files."""
-    script_path = out_dir / "ue_import.py"
-    file_list = ",\n    ".join(repr(str(path)) for path in outputs)
-    script = f'''"""Import the MapDump GLB parts into Unreal Engine 5.
+def _glb_mesh_bounds(path: Path) -> list[dict[str, Any]]:
+    """Return mesh names and local POSITION bounds from one GLB file."""
+    part = read_glb(path)
+    document = part.document
+    accessors = document.get("accessors") or []
+    meshes: list[dict[str, Any]] = []
+    used_names: set[str] = set()
+    for index, mesh in enumerate(document.get("meshes") or []):
+        name = str(mesh.get("name") or f"mesh_{index}")
+        if name in used_names:
+            name = f"{name}_{index}"
+        used_names.add(name)
+        low = [math.inf, math.inf, math.inf]
+        high = [-math.inf, -math.inf, -math.inf]
+        for primitive in mesh.get("primitives") or []:
+            position_index = (primitive.get("attributes") or {}).get("POSITION")
+            if not isinstance(position_index, int) or position_index >= len(accessors):
+                continue
+            accessor = accessors[position_index]
+            minimum = accessor.get("min")
+            maximum = accessor.get("max")
+            if not (
+                isinstance(minimum, list)
+                and isinstance(maximum, list)
+                and len(minimum) >= 3
+                and len(maximum) >= 3
+            ):
+                continue
+            for axis in range(3):
+                low[axis] = min(low[axis], float(minimum[axis]))
+                high[axis] = max(high[axis], float(maximum[axis]))
+        if not math.isfinite(low[0]):
+            continue
+        meshes.append(
+            {
+                "name": name,
+                "bounds_min": [round(value, 6) for value in low],
+                "bounds_max": [round(value, 6) for value in high],
+                "extent": [round(high[axis] - low[axis], 6) for axis in range(3)],
+            }
+        )
+    return meshes
 
-Run from the editor: Tools -> Execute Python Script... -> select this file.
-Requirements: UE 5.x with the glTF importer (Interchange) plugin enabled.
+
+_UE_IMPORT_TEMPLATE = '''"""Import the MapDump GLB parts into Unreal Engine 5.
+
+Generated by SC_Map_Dump. Run from the editor:
+Tools -> Execute Python Script... -> select this file.
+Requirements: UE 5.x with the Interchange glTF importer enabled.
 """
+import json
+import math
+
 import unreal
 
-GLB_FILES = [
-    {file_list},
-]
-DESTINATION_PATH = "/Game/MapDump"
+META_PATH = r"__META_PATH__"
+DESTINATION_PATH = "__DESTINATION_PATH__"
 SPAWN_IN_LEVEL = True
+# Set to a positive value to skip auto-detection (e.g. 100.0 = 1 block is 1 m).
+FORCED_ACTOR_SCALE = 0.0
+
+
+def load_meta():
+    with open(META_PATH, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+META = load_meta()
+TARGET_BLOCK_UNITS = float(META.get("target_block_units") or 100.0)
 
 
 def import_glbs():
     tasks = []
-    for path in GLB_FILES:
+    for part in META["parts"]:
         task = unreal.AssetImportTask()
-        task.filename = path
+        task.filename = part["file"]
         task.destination_path = DESTINATION_PATH
         task.automated = True
         task.save = True
         task.replace_existing = True
         tasks.append(task)
-    unreal.AssetToolsHelpers.get_asset_tools().import_assets_automated(tasks)
-    unreal.log(f"MapDump: imported {{len(tasks)}} glb file(s)")
+    if tasks:
+        unreal.AssetToolsHelpers.get_asset_tools().import_assets_automated(tasks)
+    unreal.log("MapDump: imported {} glb file(s)".format(len(tasks)))
+
+
+def list_static_meshes():
+    """Return every StaticMesh in the dedicated destination folder."""
+    meshes = []
+    for asset_path in unreal.EditorAssetLibrary.list_assets(DESTINATION_PATH, recursive=True):
+        data = unreal.EditorAssetLibrary.find_asset_data(asset_path)
+        try:
+            class_name = data.asset_class_path.asset_name
+        except Exception:
+            class_name = ""
+        if class_name != "StaticMesh":
+            continue
+        meshes.append(data.get_asset())
+    return meshes
+
+
+def mesh_diagonal(mesh):
+    box = mesh.get_bounding_box()
+    if not box.is_valid:
+        return 0.0
+    delta = box.max - box.min
+    return math.sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z)
+
+
+def expected_diagonal():
+    values = [
+        math.sqrt(sum(value * value for value in info.get("extent") or []))
+        for part in META["parts"]
+        for info in part.get("meshes") or []
+    ]
+    return max(values) if values else 0.0
+
+
+def actor_scale(meshes):
+    if FORCED_ACTOR_SCALE > 0.0:
+        unreal.log("MapDump: using forced actor scale {}".format(FORCED_ACTOR_SCALE))
+        return FORCED_ACTOR_SCALE
+    expected = expected_diagonal()
+    measured = max((mesh_diagonal(mesh) for mesh in meshes), default=0.0)
+    if expected <= 0.0 or measured <= 0.0:
+        unreal.log_warning(
+            "MapDump: could not measure imported meshes, assuming 1 UE unit per block"
+        )
+        units_per_block = 1.0
+    else:
+        # Uniform scaling preserves the diagonal (axis order does not matter),
+        # so the largest imported mesh vs the largest GLB mesh gives the
+        # importer's units-per-block factor, whatever Interchange did.
+        units_per_block = measured / expected
+    scale = TARGET_BLOCK_UNITS / units_per_block
+    unreal.log(
+        "MapDump: detected {} UE unit(s) per block -> actor scale {}".format(
+            units_per_block, scale
+        )
+    )
+    return scale
 
 
 def spawn_in_level():
@@ -349,34 +469,96 @@ def spawn_in_level():
     try:
         subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
     except Exception as exc:  # older engines
-        unreal.log_warning(f"MapDump: actor subsystem unavailable: {{exc}}")
+        unreal.log_warning("MapDump: actor subsystem unavailable: {}".format(exc))
         return
+    meshes = list_static_meshes()
+    if not meshes:
+        unreal.log_warning(
+            "MapDump: no StaticMesh found in {}; check the import log".format(DESTINATION_PATH)
+        )
+        return
+    scale = actor_scale(meshes)
+    location = unreal.Vector(0.0, 0.0, 0.0)
+    rotation = unreal.Rotator(0.0, 0.0, 0.0)
     spawned = 0
-    for asset_path in unreal.EditorAssetLibrary.list_assets(DESTINATION_PATH, recursive=True):
-        data = unreal.EditorAssetLibrary.find_asset_data(asset_path)
-        if data.asset_class_path.asset_name != "StaticMesh":
-            continue
-        mesh = data.get_asset()
-        subsystem.spawn_actor_from_object(mesh, unreal.Vector(0.0, 0.0, 0.0), unreal.Rotator(0.0, 0.0, 0.0))
+    for mesh in meshes:
+        actor = subsystem.spawn_actor_from_object(mesh, location, rotation)
+        actor.set_actor_scale3d(unreal.Vector(scale, scale, scale))
         spawned += 1
-    unreal.log(f"MapDump: spawned {{spawned}} static mesh actor(s)")
+    unreal.log("MapDump: spawned {} static mesh actor(s)".format(spawned))
 
 
 import_glbs()
 spawn_in_level()
 '''
+
+
+def write_unreal_helpers(out_dir: Path, outputs: list[Path], unreal_scale: float = 100.0) -> Path:
+    """Write map_meta.json plus an Unreal import script next to the GLB parts.
+
+    The meshes stay in absolute block coordinates (the exporter is called with
+    ``--no-center`` for UE mode), so every part lines up when spawned at the
+    origin. The importer's own unit conversion is unknown (Interchange may or
+    may not convert glTF metres to UE centimetres), so the generated script
+    measures the imported bounds and picks the actor scale that makes one block
+    equal ``target_block_units`` UE units.
+    """
+    script_path = out_dir / "ue_import.py"
+    meta_path = out_dir / "map_meta.json"
+
+    parts: list[dict[str, Any]] = []
+    for path in outputs:
+        path = path.resolve()
+        parts.append(
+            {
+                "file": str(path),
+                "file_name": path.name,
+                "meshes": _glb_mesh_bounds(path),
+            }
+        )
+    meta = {
+        "version": 1,
+        "generator": "SC_Map_Dump",
+        "target_block_units": float(unreal_scale),
+        "target_unit": "Unreal units (centimetres) per block",
+        "gltf_units_per_block": 1.0,
+        "centered": False,
+        "parts": parts,
+    }
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    folder = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in out_dir.name).strip("_")
+    folder = folder or "MapDump"
+    destination = f"/Game/MapDump/{folder}"
+    script = _UE_IMPORT_TEMPLATE.replace("__META_PATH__", str(meta_path))
+    script = script.replace("__DESTINATION_PATH__", destination)
     script_path.write_text(script, encoding="utf-8")
 
     notes = out_dir / "UE_IMPORT.md"
     notes.write_text(
         "# Импорт в Unreal Engine 5\n\n"
-        "1. Включите импорт glTF: Edit -> Plugins -> включите `glTF Importer` / `Interchange` (обычно уже включён в UE 5.x).\n"
+        "1. Включите импорт glTF: Edit -> Plugins -> включите `glTF Importer` / `Interchange` "
+        "(обычно уже включён в UE 5.x).\n"
         "2. Tools -> Execute Python Script... -> выберите `ue_import.py` из этой папки.\n"
         "   Либо скопируйте его содержимое в Output Log (режим Python).\n"
-        "3. Ассеты появятся в `/Game/MapDump`, статические меши будут расставлены в текущем уровне в мировых координатах.\n\n"
-        "Вершины уже пересчитаны в сантиметры (1 блок = 100 UE-единиц), оси и масштаб дополнительно настраивать не нужно.\n"
-        "Если карта кажется в 100 раз больше или меньше, поменяйте поле `unreal scale` при экспорте.\n\n"
-        "Текстуры встроены в GLB: Unreal создаст материалы и текстуры автоматически при импорте.\n",
+        f"3. Ассеты появятся в `{destination}`, статические меши будут расставлены в текущем уровне.\n\n"
+        "## Масштаб\n\n"
+        f"Цель экспорта: **1 блок = {unreal_scale:g} UE-единиц** (обычно 100 см = 1 м).\n\n"
+        "Скрипт сам измеряет импортированные меши: glTF хранит размеры в метрах, а UE работает "
+        "в сантиметрах, и разные версии Interchange конвертируют это по-разному. Поэтому "
+        "`ue_import.py` сравнивает реальные границы меша с границами из `map_meta.json` и "
+        "подбирает масштаб актёра автоматически.\n\n"
+        "Если карта всё равно кажется в 100 раз больше или меньше, откройте `ue_import.py` и "
+        "задайте `FORCED_ACTOR_SCALE = 100.0` (или `1.0`) вместо автоопределения, либо "
+        "переэкспортируйте с другим полем `unreal scale`.\n\n"
+        "## Файлы\n\n"
+        "- `.glb` — геометрия и встроенные текстуры; части остаются в абсолютных мировых "
+        "координатах блоков, поэтому не нужно двигать их вручную.\n"
+        "- `map_meta.json` — список частей, имена мешей, их границы и целевой масштаб. "
+        "Скрипт читает этот файл; не удаляйте его.\n"
+        "- `ue_import.py` — импорт и расстановка в уровне.\n\n"
+        "Текстуры встроены в GLB: Unreal создаст материалы и текстуры автоматически при импорте. "
+        "Если GLB-частей несколько, импортируйте их все — скрипт делает это за один запуск.\n",
         encoding="utf-8",
     )
     return script_path

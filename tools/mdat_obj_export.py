@@ -31,6 +31,15 @@ try:
 except ImportError as exc:  # pragma: no cover - environment dependent
     raise SystemExit("Missing dependency: pip install zstandard") from exc
 
+# Optional: `sc-file` (pip install sc-file) decodes the game's `.mcsb`/`.mcsa`
+# model meshes. Without it, model blocks fall back to the cross placeholder.
+try:
+    import scfile.formats as _scformats
+    _HAS_SCFILE = True
+except ImportError:  # pragma: no cover - environment dependent
+    _scformats = None  # type: ignore[assignment]
+    _HAS_SCFILE = False
+
 
 SECTOR_SIZE = 4096
 REGION_BITS = 5
@@ -162,6 +171,19 @@ DEFAULT_CTM_DIR = DEFAULT_GAME_DIR / "modassets" / "assets" / "stalcraft" / "ctm
 TEXARR_TA_AES_KEY = bytes([11, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0, 12, 13, 14, 15])
 TEXARR_TA_AES_IV = b"0123456789ABCDFE"
 
+# Sprite transparencies below this alpha value count as "real" transparency.
+# BlockMap DDS entries are DXT companions, so solid sprites still carry a few
+# 220..254 alpha pixels that must not turn every material into an alpha test.
+ALPHA_SIGNIFICANT = 200
+# Minimum share of pixels that must be transparent before a sprite is treated
+# as an alpha sprite at all.
+MIN_ALPHA_COVERAGE = 0.02
+# A sprite whose alpha is dominated by the extremes 0/255 is a cutout and uses
+# alphaMode MASK (crisp foliage, matching the in-game alpha test). Water, glass
+# and fog sprites carry soft alpha everywhere, so their extreme share is low and
+# they stay alphaMode BLEND.
+CUTOUT_ALPHA_RATIO = 0.60
+
 
 @dataclass(frozen=True)
 class BlockState:
@@ -226,6 +248,70 @@ class ModelFace:
 class ExternalModelMesh:
     source: Path
     faces: Tuple[ModelFace, ...]
+
+
+def decode_model_faces(path: Path) -> Optional[Tuple[ModelFace, ...]]:
+    """Decode a `.mcsb`/`.mcsa` model into triangle faces via `sc-file`.
+
+    Returns ``None`` when `sc-file` is unavailable or the model cannot be
+    decoded, so callers fall back to the placeholder.
+    """
+    if not _HAS_SCFILE or path.suffix.lower() not in {".mcsb", ".mcsa"}:
+        return None
+    try:
+        decoder_cls = _scformats.McsbDecoder if path.suffix.lower() == ".mcsb" else _scformats.McsaDecoder
+        with decoder_cls(str(path)) as decoder:
+            model = decoder.decode()
+    except Exception:
+        return None
+    faces: List[ModelFace] = []
+    try:
+        for mesh in model.scene.meshes:
+            vertices = mesh.vertices
+            polygons = mesh.polygons
+            uv1 = mesh.uv1
+            if vertices is None or polygons is None or len(vertices) == 0:
+                continue
+            n = len(vertices)
+            if uv1 is None or len(uv1) < n:
+                uv1 = None
+            for triangle in polygons:
+                if len(triangle) < 3:
+                    continue
+                face_verts: List[Tuple[float, float, float]] = []
+                face_uvs: List[UV] = []
+                for index in triangle[:3]:
+                    index = int(index)
+                    if index < 0 or index >= n:
+                        break
+                    x, y, z = vertices[index]
+                    face_verts.append((float(x), float(y), float(z)))
+                    if uv1 is not None:
+                        u, v = uv1[index]
+                        # sc-file emits top-left UVs (V=0 at top). The exporter's
+                        # `add_polygon` flips V assuming OBJ-style bottom-left
+                        # input, so pre-flip here to cancel it out.
+                        face_uvs.append((float(u), 1.0 - float(v)))
+                if len(face_verts) == 3:
+                    faces.append(ModelFace(tuple(face_verts), tuple(face_uvs) if len(face_uvs) == 3 else ()))
+    except Exception:
+        return None
+    if not faces:
+        return None
+    return tuple(faces)
+
+
+def _resolve_game_assets_root(texarr_path: Path) -> Optional[Path]:
+    """Derive `modassets/assets` from the blockMap.texarr path.
+
+    ``<game>/modassets/assets/stalcraft/textures/blockMap.texarr`` ->
+    ``<game>/modassets/assets``. Returns ``None`` when the layout is unexpected.
+    """
+    try:
+        assets = texarr_path.resolve().parents[2]
+    except Exception:
+        return None
+    return assets if assets.is_dir() else None
 
 
 class ByteReader:
@@ -2231,6 +2317,9 @@ class FaceMaterialDescriptor:
     tint: Optional[Tuple[float, float, float]]
     emissive: Optional[Tuple[float, float, float]] = None
     note: str = ""
+    #: Sprite carries real intermediate alpha (water, glass, fog) and must keep
+    #: alphaMode BLEND; cutout sprites stay opaque-tested instead.
+    translucent: bool = False
 
 
 def decrypt_texarr_ta(data: bytes) -> bytes:
@@ -2503,6 +2592,15 @@ class JavaRandom:
 
 
 class TextureResolver:
+    #: The game stores some side sprites as fully transparent tint masks: the
+    #: visible layer is the dirt block underneath plus a separate overlay pass.
+    #: Rendering the mask directly would punch holes in terrain walls, so those
+    #: ids resolve to their real base sprite instead.
+    BLANK_ICON_SUBSTITUTES = {
+        "stalcraft:grass_side": "stalcraft:dirt",
+        "stalcraft:dirt2_side": "stalcraft:dirt",
+    }
+
     def __init__(
         self,
         map_blocks_path: Path,
@@ -2543,6 +2641,9 @@ class TextureResolver:
         # split drives glTF `alphaMode` MASK vs BLEND.
         self.translucent_icons: Set[str] = set()
         self.alpha_texture_rels: Set[str] = set()
+        # DDS entries that are fully transparent (the game uses them as tint
+        # masks, not as visible sprites). Rendering them directly leaves holes.
+        self.blank_icons: Set[str] = set()
         self.missing_icons: Set[str] = set()
         self.convert_fallbacks: Set[str] = set()
         self._png_bytes_cache: Dict[str, Optional[bytes]] = {}
@@ -3070,6 +3171,7 @@ class TextureResolver:
         icon = self.block_icon_name(block_id, meta, side, pos)
         if allow_ctm:
             icon = self.ctm_icon_name(block_id, meta, pos, side, tile, icon)
+        icon = self.substitute_blank_icon(icon)
         if tint is None:
             tint = self.biome_tint_for_block(block_id, meta, pos, side, icon)
         if icon is None:
@@ -3219,18 +3321,29 @@ class TextureResolver:
                 image = image.convert("RGBA")
             if "A" in image.getbands():
                 alpha = image.getchannel("A")
-                alpha_min, _alpha_max = alpha.getextrema()
-                if alpha_min < 255:
+                alpha_min, alpha_max = alpha.getextrema()
+                if alpha_max == 0:
+                    # Fully transparent technical sprite (barrier/invisible mask).
+                    # Keep it in alpha_icons so the material stays MASK and the
+                    # 0.5 cutoff hides the surface completely.
+                    self.blank_icons.add(icon_name)
                     self.alpha_icons.add(icon_name)
-                    # Histogram-based cutout vs translucent split: if at least
-                    # 99% of alpha values are at the extremes (0 or 255), treat
-                    # as cutout (`MASK`); otherwise the sprite carries real
-                    # intermediate transparency and needs `BLEND`.
+                elif alpha_min < ALPHA_SIGNIFICANT:
                     histogram = alpha.histogram()
-                    cutout = histogram[0] + histogram[255]
                     total = sum(histogram)
-                    if total > 0 and cutout / total < 0.99:
-                        self.translucent_icons.add(icon_name)
+                    # DXT companions leave a few near-opaque pixels (220..254) on
+                    # otherwise solid sprites; only count real transparency so
+                    # stone/dirt/grass keep alphaMode OPAQUE.
+                    transparent = sum(histogram[:ALPHA_SIGNIFICANT])
+                    if total > 0 and transparent / total >= MIN_ALPHA_COVERAGE:
+                        self.alpha_icons.add(icon_name)
+                        # Histogram-based cutout vs translucent split: if the
+                        # alpha values are dominated by the extremes (0/255),
+                        # treat as cutout (`MASK`); otherwise the sprite carries
+                        # real intermediate transparency and needs `BLEND`.
+                        cutout = histogram[0] + histogram[255]
+                        if cutout / total < CUTOUT_ALPHA_RATIO:
+                            self.translucent_icons.add(icon_name)
             buffer = io.BytesIO()
             image.save(buffer, format="PNG", optimize=False)
             png_bytes = buffer.getvalue()
@@ -3264,6 +3377,7 @@ class TextureResolver:
         icon = self.block_icon_name(block_id, meta, side, pos)
         if allow_ctm:
             icon = self.ctm_icon_name(block_id, meta, pos, side, tile, icon)
+        icon = self.substitute_blank_icon(icon)
         png_bytes = self.png_bytes_for_icon(icon) if icon else None
         tint = explicit_tint
         if tint is None:
@@ -3276,6 +3390,7 @@ class TextureResolver:
             png_bytes=png_bytes,
             alpha_mode=alpha_mode,
             tint=tint,
+            translucent=icon in self.translucent_icons,
         )
 
     def overlay_material_descriptor(
@@ -3299,7 +3414,26 @@ class TextureResolver:
             png_bytes=png_bytes,
             alpha_mode=alpha_mode,
             tint=tint,
+            translucent=icon in self.translucent_icons,
         )
+
+    def icon_is_blank(self, icon: Optional[str]) -> bool:
+        if icon is None:
+            return False
+        if icon not in self.blank_icons:
+            self.png_bytes_for_icon(icon)
+        return icon in self.blank_icons
+
+    def substitute_blank_icon(self, icon: Optional[str]) -> Optional[str]:
+        """Swap fully transparent tint-mask sprites for the visible base layer."""
+        if icon is None:
+            return None
+        alias = self.BLANK_ICON_SUBSTITUTES.get(icon)
+        if alias is None:
+            return icon
+        if self.icon_is_blank(alias):
+            return icon
+        return alias
 
     def _alpha_mode_for_icon(self, icon: Optional[str]) -> str:
         if icon is None:
@@ -4351,6 +4485,7 @@ class GeometryResolver:
         geometry_report: Optional[Dict[int, Dict[str, Any]]] = None,
         model_placeholder: str = "cross",
         mesh_mode: str = "collision",
+        game_assets_root: Optional[Path] = None,
     ) -> None:
         self.block_type_by_id = block_type_by_id
         self.shape_tables = shape_tables
@@ -4360,6 +4495,8 @@ class GeometryResolver:
         self.geometry_report = geometry_report or {}
         self.model_placeholder = model_placeholder
         self.mesh_mode = mesh_mode
+        self.game_assets_root = game_assets_root
+        self._model_cache: Dict[str, Optional[ExternalModelMesh]] = {}
 
     def class_for(self, block_id: int) -> Optional[int]:
         type_id = self.block_type_by_id.get(block_id)
@@ -4384,7 +4521,43 @@ class GeometryResolver:
         return bool(config.get("model")) and bool(config.get("simple_render"))
 
     def external_model_mesh_for_block(self, block_id: int) -> Optional[ExternalModelMesh]:
-        return None
+        config = self.external_config_for_block(block_id)
+        if config is None:
+            return None
+        model_ref = config.get("model")
+        if not isinstance(model_ref, str) or not model_ref:
+            return None
+        cached = self._model_cache.get(model_ref)
+        if cached is not None:
+            return cached
+        mesh: Optional[ExternalModelMesh] = None
+        path = self._resolve_model_path(model_ref)
+        if path is not None:
+            faces = decode_model_faces(path)
+            if faces is not None:
+                mesh = ExternalModelMesh(source=path, faces=faces)
+        self._model_cache[model_ref] = mesh
+        return mesh
+
+    def _resolve_model_path(self, model_ref: str) -> Optional[Path]:
+        """Resolve a `namespace:relative/path.mcsa` model ref to a `.mcsb` file.
+
+        The shipped game assets only contain compiled `.mcsb` meshes, while the
+        configs reference the source `.mcsa` spelling, so the extension is
+        swapped and looked up under `modassets/assets/<namespace>/`.
+        """
+        if self.game_assets_root is None:
+            return None
+        namespace, sep, rest = model_ref.partition(":")
+        if not sep or not rest:
+            return None
+        relative = Path(rest)
+        if relative.suffix.lower() == ".mcsa":
+            relative = relative.with_suffix(".mcsb")
+        elif relative.suffix.lower() != ".mcsb":
+            return None
+        candidate = self.game_assets_root / namespace / relative
+        return candidate if candidate.is_file() else None
 
     @staticmethod
     def external_model_rotation(meta: int) -> float:
@@ -5380,10 +5553,11 @@ class GltfBuilder:
             prospective_name = self._material_name_for_icon(prospective_descriptor)
             if _INV_MASK_NAME_RE.search(prospective_name):
                 return SKIP_MATERIAL_INDEX
-        if force_mask and alpha_mode == "BLEND":
-            # glTF BLEND materials don't write to depth, so plant/foliage sprites
-            # show through each other in viewers. Promoting to MASK with a 0.5
-            # cutoff produces correct depth-sorted opaque-cutout rendering.
+        if force_mask and alpha_mode == "BLEND" and not descriptor.translucent:
+            # glTF BLEND materials don't write to depth, so cutout foliage shows
+            # through itself in some viewers. Sprites with real intermediate
+            # alpha (water, glass) keep BLEND because a 0.5 cutoff would make
+            # them fully opaque.
             alpha_mode = "MASK"
         emissive_key = None if descriptor.emissive is None else tuple(round(c, 4) for c in descriptor.emissive)
         key = ("desc", descriptor.icon, alpha_mode, emissive_key, bool(double_sided))
@@ -5593,7 +5767,7 @@ def _add_buffer_chunk(buffer: bytearray, data: bytes, alignment: int = 4) -> Tup
     return offset, len(data)
 
 
-def _serialize_glb(builder: "GltfBuilder", output_path: Path) -> Tuple[int, int, int, int, int]:
+def _serialize_glb(builder: "GltfBuilder", output_path: Path, mesh_name: str = "world") -> Tuple[int, int, int, int, int]:
     bin_buffer = bytearray()
     buffer_views: List[Dict[str, Any]] = []
     accessors: List[Dict[str, Any]] = []
@@ -5685,8 +5859,8 @@ def _serialize_glb(builder: "GltfBuilder", output_path: Path) -> Tuple[int, int,
         "asset": {"version": "2.0", "generator": "tools/mdat_obj_export.py glTF writer"},
         "scene": 0,
         "scenes": [{"nodes": [0]}],
-        "nodes": [{"mesh": 0, "name": "world"}],
-        "meshes": [{"primitives": primitives_meta, "name": "world"}],
+        "nodes": [{"mesh": 0, "name": mesh_name}],
+        "meshes": [{"primitives": primitives_meta, "name": mesh_name}],
         "materials": builder.materials,
         "samplers": samplers_json,
         "buffers": [{"byteLength": len(bin_buffer)}],
@@ -5730,6 +5904,7 @@ def write_glb(
     force_mask: bool = False,
     hide_invisible: bool = False,
     scale: float = 1.0,
+    mesh_name: str = "world",
 ) -> Tuple[int, int, int, int, int]:
     """Write a GLB file representing the resolved world geometry.
 
@@ -5885,7 +6060,7 @@ def write_glb(
             return None
         overlay_value = GeometryResolver.tile_overlay_value(tile, material_side or side)
         icon = texture_resolver.probuilder_overlay_icon_name(overlay_value, side)
-        if icon is None:
+        if icon is None or texture_resolver.icon_is_blank(icon):
             return None
         tint = overlay_tint_for_icon(pos, tile, material_side or side, icon)
         descriptor = texture_resolver.overlay_material_descriptor(icon, tint)
@@ -5902,7 +6077,7 @@ def write_glb(
         if texture_resolver is None or texture_state is None:
             return None
         icon = texture_resolver.block_overlay_icon_name(texture_state.block_id, texture_state.meta, side, pos)
-        if icon is None:
+        if icon is None or texture_resolver.icon_is_blank(icon):
             return None
         tint = GeometryResolver.tile_tint(tile, tint_side) or texture_resolver.biome_tint_for_block(
             texture_state.block_id,
@@ -6179,7 +6354,7 @@ def write_glb(
                         outward_reference=phantom_center,
                     )
 
-    return _serialize_glb(builder, output_path)
+    return _serialize_glb(builder, output_path, mesh_name)
 
 
 def parse_args() -> argparse.Namespace:
@@ -6191,6 +6366,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--geometry-report", type=Path, default=DEFAULT_GEOMETRY_REPORT)
     parser.add_argument("--max-chunks", type=int, default=None, help="Limit chunks for tests/small exports.")
     parser.add_argument("--max-blocks", type=int, default=None, help="Stop after exporting this many selected blocks.")
+    parser.add_argument(
+        "--name",
+        default=None,
+        help="Mesh/node name inside the GLB. Defaults to the output file stem so merged parts keep unique names.",
+    )
     parser.add_argument(
         "--double-sided",
         action="store_true",
@@ -6250,12 +6430,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--group-by-cover", action="store_true", help="For ProBuilder tiles, include cover/data in OBJ groups.")
     parser.add_argument(
+        "--no-center",
+        action="store_true",
+        help="Keep world block coordinates instead of centering each file on its own bounding box.",
+    )
+    parser.add_argument(
         "--scale",
         type=float,
         default=1.0,
         help=(
-            "Bake a uniform scale into vertex coordinates. Unreal Engine works in "
-            "centimetres, so use --scale 100 for UE exports."
+            "Bake a uniform scale into vertex coordinates (manual override). "
+            "The app's Unreal mode leaves the GLB in blocks and applies the "
+            "scale at import time instead."
         ),
     )
     parser.add_argument(
@@ -6278,7 +6464,7 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     args.input_kind = "mdat"
-    args.center = True
+    args.center = not args.no_center
     args.no_cull = False
     args.mesh_mode = "render"
     args.texture_mode = "game"
@@ -6379,6 +6565,7 @@ def main() -> None:
         geometry_report=geometry_report,
         model_placeholder=args.model_placeholder,
         mesh_mode=args.mesh_mode,
+        game_assets_root=_resolve_game_assets_root(args.texarr),
     )
     texture_resolver = None
     if args.texture_mode == "game":
@@ -6407,6 +6594,8 @@ def main() -> None:
         if phantoms:
             print(f"[liquid] phantom water cells: {len(phantoms)} (radius={args.water_expand})")
             LIQUID_PHANTOM_POSITIONS.update(phantoms)
+    mesh_name = args.name or args.output.stem
+    mesh_name = re.sub(r"[^A-Za-z0-9_]+", "_", mesh_name).strip("_") or "world"
     vertices, faces, glb_materials, glb_images, glb_size = write_glb(
         output_path=args.output,
         world_blocks=export_blocks,
@@ -6419,6 +6608,7 @@ def main() -> None:
         force_mask=args.force_mask,
         hide_invisible=args.hide_invisible,
         scale=args.scale,
+        mesh_name=mesh_name,
     )
 
     strategy_counts: Dict[str, int] = {}
@@ -6436,6 +6626,9 @@ def main() -> None:
         f"shape_tables={len(shape_tables)} tiles={len(world_tiles)}"
     )
     print(f"selected_ids={len(include_ids) if include_ids is not None else 'all'}")
+    decoded_models = [name for name, mesh in resolver._model_cache.items() if mesh is not None]
+    if decoded_models:
+        print(f"model_meshes={len(decoded_models)} (3D .mcsb models loaded via sc-file)")
     if texture_resolver is not None:
         print(
             "textures="

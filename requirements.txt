@@ -1,3 +1,4 @@
 Pillow
 cryptography
 zstandard
+sc-file
